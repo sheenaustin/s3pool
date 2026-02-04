@@ -1,0 +1,58 @@
+# S3Pool v2 Configuration Example
+#
+# This file demonstrates the YAML configuration format for s3pool v2.
+# You can use this as a template for your own configuration.
+
+# Define named profiles for different S3 configurations
+profiles:
+  # Production profile with multiple endpoints
+  production:
+    endpoints:
+      - https://s3-1.example.com:9000
+      - https://s3-2.example.com:9000
+      - https://s3-3.example.com:9000
+    access_key: AKIAIOSFODNN7EXAMPLE
+    secret_key: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+    region: us-east-1
+    bucket: my-bucket
+
+  # Development profile with single endpoint
+  development:
+    endpoints:
+      - http://localhost:9000
+    access_key: minioadmin
+    secret_key: minioadmin
+    region: us-east-1
+
+  # Staging profile
+  staging:
+    endpoints:
+      - https://s3-staging.example.com
+    access_key: STAGING_KEY
+    secret_key: STAGING_SECRET
+    region: us-west-2
+
+# Load balancer configuration
+load_balancer:
+  # Strategy: round_robin, least_connections, random, weighted
+  strategy: round_robin
+
+  # Health check interval in seconds
+  health_check_interval: 30
+
+  # Request timeout in seconds
+  request_timeout: 300
+
+  # Maximum retries per request
+  max_retries: 3
+
+  # Enable connection pooling
+  connection_pooling: true
+
+# Proxy server configuration
+proxy:
+  # Address to listen on (IP:PORT)
+  listen: "0.0.0.0:8000"
+
+  # Default profile to use when none is specified
+  default_profile: production
