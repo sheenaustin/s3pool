@@ -1,6 +1,6 @@
 [package]
 name = "s3pool"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["s3pool contributors"]
 description = "Ultra-fast S3 client with built-in load balancing - CLI and proxy modes"
