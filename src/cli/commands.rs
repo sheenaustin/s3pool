@@ -523,41 +523,22 @@ pub async fn cmd_ls(core: &Core, path: &str, recursive: bool, max_keys: usize) -
     let mut current_text = String::with_capacity(256);
     let mut cp_prefix = String::with_capacity(256);
 
-    // Fetch first page with endpoint rotation on failure.
-    // Try different endpoints if connection fails (backend may be down).
-    // Uses single-attempt requests to fail fast on dead backends (~100ms vs 700ms).
-    // Failed endpoints are marked unhealthy so future requests skip them.
-    // Once successful, reuse the same endpoint for all remaining pages
-    // to benefit from TLS connection reuse and server-side caching.
+    // Fetch first page with endpoint rotation on failure (shared retry logic)
     let (endpoint, raw_xml) = {
-        let mut last_err = None;
-        let mut result = None;
-        for retry in 0..5 {
-            let (ep, idx) = core.select_endpoint_with_index()?;
-            let ep = ep.to_string();
-            match client.list_objects_v2_raw_once(
-                &ep,
-                prefix.as_deref(),
-                None,  // Let server decide max keys per page
-                None,
-                delimiter,
-            ).await {
-                Ok(bytes) => {
-                    core.record_success(idx);
-                    result = Some((ep, bytes));
-                    break;
-                }
-                Err(e) => {
-                    core.record_failure(idx);
-                    tracing::debug!("Fetch from {} failed ({}), trying another endpoint", ep, e);
-                    last_err = Some(e);
-                }
+        let prefix_clone = prefix.clone();
+        core.with_endpoint_retry_returning_endpoint(|ep| {
+            let client = client.clone();
+            let prefix = prefix_clone.clone();
+            async move {
+                client.list_objects_v2_raw_once(
+                    &ep,
+                    prefix.as_deref(),
+                    None,  // Let server decide max keys per page
+                    None,
+                    delimiter,
+                ).await.map_err(|e| anyhow::anyhow!("{}", e))
             }
-            if retry == 4 {
-                return Err(anyhow::anyhow!("All endpoints failed for first page: {}", last_err.unwrap()));
-            }
-        }
-        result.ok_or_else(|| anyhow::anyhow!("All endpoints failed"))?
+        }).await?
     };
 
     // Sequential pagination with endpoint rotation
@@ -700,37 +681,23 @@ pub async fn cmd_ls(core: &Core, path: &str, recursive: bool, max_keys: usize) -
             break;
         }
 
-        // Fetch next page - rotate endpoint to avoid per-connection throttling
-        // Retry with different endpoints if connection fails
-        if let Some(token) = continuation_token.as_deref() {
-            let mut last_err = None;
-            let mut fetched = false;
-            for _retry in 0..5 {
-                let (ep, idx) = core.select_endpoint_with_index()?;
-                let ep = ep.to_string();
-                match client.list_objects_v2_raw_once(
-                    &ep,
-                    prefix.as_deref(),
-                    None,
-                    Some(token),
-                    delimiter,
-                ).await {
-                    Ok(bytes) => {
-                        core.record_success(idx);
-                        raw_xml = bytes;
-                        fetched = true;
-                        break;
-                    }
-                    Err(e) => {
-                        core.record_failure(idx);
-                        tracing::debug!("Page fetch from {} failed ({}), trying another endpoint", ep, e);
-                        last_err = Some(e);
-                    }
+        // Fetch next page with endpoint rotation (shared retry logic)
+        if let Some(token) = continuation_token.clone() {
+            let prefix_clone = prefix.clone();
+            raw_xml = core.with_endpoint_retry(|ep| {
+                let client = client.clone();
+                let prefix = prefix_clone.clone();
+                let token = token.clone();
+                async move {
+                    client.list_objects_v2_raw_once(
+                        &ep,
+                        prefix.as_deref(),
+                        None,
+                        Some(&token),
+                        delimiter,
+                    ).await.map_err(|e| anyhow::anyhow!("{}", e))
                 }
-            }
-            if !fetched {
-                return Err(anyhow::anyhow!("All endpoints failed for page fetch: {:?}", last_err));
-            }
+            }).await?;
         } else {
             break;
         }
@@ -784,12 +751,21 @@ pub async fn cmd_cp(
             const MULTIPART_THRESHOLD: u64 = 64 * 1024 * 1024;
 
             if file_size < MULTIPART_THRESHOLD {
-                // Small file: simple PUT (like mc)
+                // Small file: simple PUT with retry (like mc)
                 let data = std::fs::read(local_path)?;
                 println!("{} -> s3://{}/{}", local_path.display(), bucket, key);
 
-                let endpoint = core.select_endpoint()?;
-                client.put_object(endpoint, key, Bytes::from(data)).await?;
+                let key = key.clone();
+                let data = Bytes::from(data);
+                core.with_endpoint_retry(|ep| {
+                    let client = client.clone();
+                    let key = key.clone();
+                    let data = data.clone();
+                    async move {
+                        client.put_object(&ep, &key, data).await
+                            .map_err(|e| anyhow::anyhow!("{}", e))
+                    }
+                }).await?;
             } else {
                 // Large file: multipart upload (like mc)
                 println!("{} -> s3://{}/{} (multipart)", local_path.display(), bucket, key);
@@ -832,9 +808,18 @@ pub async fn cmd_cp(
                 std::fs::create_dir_all(parent)?;
             }
 
-            // Select endpoint per download (distributes load across backends)
-            let endpoint = core.select_endpoint()?;
-            let bytes_written = client.download_object_to_file(endpoint, key, local_path).await?;
+            // Download with retry logic
+            let key = key.clone();
+            let local_path = local_path.clone();
+            let bytes_written = core.with_endpoint_retry(|ep| {
+                let client = client.clone();
+                let key = key.clone();
+                let local_path = local_path.clone();
+                async move {
+                    client.download_object_to_file(&ep, &key, &local_path).await
+                        .map_err(|e| anyhow::anyhow!("{}", e))
+                }
+            }).await?;
             println!("  {} downloaded", format_bytes(bytes_written));
         }
     } else {
@@ -960,18 +945,23 @@ pub async fn cmd_stat(core: &Core, path: &str) -> Result<()> {
     let (bucket, key) = crate::cli::args::parse_s3_path(path)?;
     let key = key.ok_or_else(|| anyhow::anyhow!("Object key is required for stat command"))?;
 
-    // Get S3 client (with bucket from path) and endpoint
+    // Get S3 client (with bucket from path)
     let client = core.s3_client()?.with_bucket(bucket.clone());
-    let endpoint = core.select_endpoint()?;
 
-    // Get object metadata by listing with the exact key as prefix
-    let response = client.list_objects_v2(
-        endpoint,
-        Some(&key),
-        Some(1),
-        None,
-        None,
-    ).await?;
+    // Use endpoint retry to handle connection failures
+    let response = core.with_endpoint_retry(|endpoint| {
+        let client = client.clone();
+        let key = key.clone();
+        async move {
+            client.list_objects_v2(
+                &endpoint,
+                Some(&key),
+                Some(1),
+                None,
+                None,
+            ).await.map_err(|e| anyhow::anyhow!("{}", e))
+        }
+    }).await?;
 
     if response.contents.is_empty() {
         anyhow::bail!("Object not found: {}", key);
@@ -995,12 +985,18 @@ pub async fn cmd_mb(core: &Core, bucket: &str) -> Result<()> {
     // Parse the S3 path to extract bucket name
     let (bucket_name, _) = crate::cli::args::parse_s3_path(bucket)?;
 
-    // Get S3 client (with bucket from path) and endpoint
+    // Get S3 client (with bucket from path)
     let client = core.s3_client()?.with_bucket(bucket_name.clone());
-    let endpoint = core.select_endpoint()?;
 
-    // Create the bucket
-    client.create_bucket(endpoint, &bucket_name).await?;
+    // Use endpoint retry to handle connection failures
+    core.with_endpoint_retry(|endpoint| {
+        let client = client.clone();
+        let bucket_name = bucket_name.clone();
+        async move {
+            client.create_bucket(&endpoint, &bucket_name).await
+                .map_err(|e| anyhow::anyhow!("{}", e))
+        }
+    }).await?;
 
     println!("Bucket created: s3://{}", bucket_name);
 
@@ -1080,37 +1076,51 @@ pub async fn cmd_du(core: &Core, path: &str) -> Result<()> {
     // Parse the S3 path
     let (bucket, prefix) = crate::cli::args::parse_s3_path(path)?;
 
-    // Get S3 client (with bucket from path) and endpoint
+    // Get S3 client (with bucket from path)
     let client = core.s3_client()?.with_bucket(bucket.clone());
-    let endpoint = core.select_endpoint()?;
 
     // Calculate total size
-    let mut continuation_token = None;
+    let mut continuation_token: Option<String> = None;
     let mut total_size: u64 = 0;
     let mut object_count = 0;
 
     println!("Calculating disk usage for s3://{}/{}...", bucket, prefix.as_deref().unwrap_or(""));
 
-    loop {
-        let response = client.list_objects_v2(
-            endpoint,
-            prefix.as_deref(),
-            Some(1000),
-            continuation_token.as_deref(),
-            None,
-        ).await?;
+    // First page with retry logic (shared helper)
+    let prefix_clone = prefix.clone();
+    let response = core.with_endpoint_retry(|ep| {
+        let client = client.clone();
+        let prefix = prefix_clone.clone();
+        async move {
+            client.list_objects_v2(&ep, prefix.as_deref(), Some(1000), None, None)
+                .await.map_err(|e| anyhow::anyhow!("{}", e))
+        }
+    }).await?;
+
+    for obj in &response.contents {
+        total_size += obj.size;
+        object_count += 1;
+    }
+    continuation_token = if response.is_truncated { response.next_continuation_token } else { None };
+
+    // Subsequent pages with endpoint rotation (shared helper)
+    while let Some(token) = continuation_token {
+        let prefix_clone = prefix.clone();
+        let response = core.with_endpoint_retry(|ep| {
+            let client = client.clone();
+            let prefix = prefix_clone.clone();
+            let token = token.clone();
+            async move {
+                client.list_objects_v2(&ep, prefix.as_deref(), Some(1000), Some(&token), None)
+                    .await.map_err(|e| anyhow::anyhow!("{}", e))
+            }
+        }).await?;
 
         for obj in &response.contents {
             total_size += obj.size;
             object_count += 1;
         }
-
-        // Check if there are more objects
-        if response.is_truncated {
-            continuation_token = response.next_continuation_token;
-        } else {
-            break;
-        }
+        continuation_token = if response.is_truncated { response.next_continuation_token } else { None };
     }
 
     println!();
@@ -1131,9 +1141,8 @@ pub async fn cmd_find(
     // Parse the S3 path
     let (bucket, prefix) = crate::cli::args::parse_s3_path(path)?;
 
-    // Get S3 client (with bucket from path) and endpoint
+    // Get S3 client (with bucket from path)
     let client = core.s3_client()?.with_bucket(bucket.clone());
-    let endpoint = core.select_endpoint()?;
 
     // Parse size filters
     let min_size = if let Some(larger_str) = larger {
@@ -1148,41 +1157,38 @@ pub async fn cmd_find(
         None
     };
 
-    // Find matching objects
-    let mut continuation_token = None;
+    // Find matching objects with endpoint rotation per page
+    let mut continuation_token: Option<String> = None;
     let mut found_count = 0;
 
-    loop {
-        let response = client.list_objects_v2(
-            endpoint,
-            prefix.as_deref(),
-            Some(1000),
-            continuation_token.as_deref(),
-            None,
-        ).await?;
+    // Helper to check if object matches filters
+    let matches_filters = |obj: &crate::s3::S3Object| -> bool {
+        if let Some(pattern) = name {
+            if !obj.key.contains(pattern) { return false; }
+        }
+        if let Some(min) = min_size {
+            if obj.size < min { return false; }
+        }
+        if let Some(max) = max_size {
+            if obj.size > max { return false; }
+        }
+        true
+    };
 
-        for obj in &response.contents {
-            // Check name pattern
-            if let Some(pattern) = name {
-                if !obj.key.contains(pattern) {
-                    continue;
-                }
-            }
+    // First page with retry logic
+    let prefix_clone = prefix.clone();
+    let response = core.with_endpoint_retry(|ep| {
+        let client = client.clone();
+        let prefix = prefix_clone.clone();
+        async move {
+            client.list_objects_v2(&ep, prefix.as_deref(), Some(1000), None, None)
+                .await.map_err(|e| anyhow::anyhow!("{}", e))
+        }
+    }).await?;
 
-            // Check size filters
-            if let Some(min) = min_size {
-                if obj.size < min {
-                    continue;
-                }
-            }
-
-            if let Some(max) = max_size {
-                if obj.size > max {
-                    continue;
-                }
-            }
-
-            // Object matches all filters
+    // Process first page
+    for obj in &response.contents {
+        if matches_filters(obj) {
             println!("{:>12}  {}  s3://{}/{}",
                 format_bytes(obj.size),
                 obj.last_modified.as_deref().unwrap_or("Unknown"),
@@ -1191,13 +1197,35 @@ pub async fn cmd_find(
             );
             found_count += 1;
         }
+    }
+    continuation_token = if response.is_truncated { response.next_continuation_token } else { None };
 
-        // Check if there are more objects
-        if response.is_truncated {
-            continuation_token = response.next_continuation_token;
-        } else {
-            break;
+    // Subsequent pages with endpoint rotation
+    while let Some(token) = continuation_token {
+        let prefix_clone = prefix.clone();
+        let token_clone = token.clone();
+        let response = core.with_endpoint_retry(|ep| {
+            let client = client.clone();
+            let prefix = prefix_clone.clone();
+            let token = token_clone.clone();
+            async move {
+                client.list_objects_v2(&ep, prefix.as_deref(), Some(1000), Some(&token), None)
+                    .await.map_err(|e| anyhow::anyhow!("{}", e))
+            }
+        }).await?;
+
+        for obj in &response.contents {
+            if matches_filters(obj) {
+                println!("{:>12}  {}  s3://{}/{}",
+                    format_bytes(obj.size),
+                    obj.last_modified.as_deref().unwrap_or("Unknown"),
+                    bucket,
+                    obj.key
+                );
+                found_count += 1;
+            }
         }
+        continuation_token = if response.is_truncated { response.next_continuation_token } else { None };
     }
 
     if found_count == 0 {

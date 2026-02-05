@@ -234,6 +234,7 @@ impl ProxyServer {
         let mut last_resp_headers = hyper::HeaderMap::new();
         let mut last_resp_body = bytes::Bytes::new();
         let mut last_backend = String::new();
+        let mut tried_backends: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
         for attempt in 0..MAX_RETRIES {
             // Select a backend endpoint (with index for health tracking)
@@ -261,11 +262,11 @@ impl ProxyServer {
                     }
                 }
             } else {
-                // Normal rotation for non-multipart requests
-                match self.core.select_endpoint_with_index() {
-                    Ok((ep, idx)) => (ep.to_string(), idx),
-                    Err(e) => {
-                        error!(error = %e, "no_healthy_backend");
+                // Normal rotation - use shared helper for untried endpoint selection
+                match self.core.select_untried_endpoint(&tried_backends) {
+                    Some(result) => result,
+                    None => {
+                        error!("no_healthy_backend_after_retries");
                         return self.error_response(
                             StatusCode::SERVICE_UNAVAILABLE,
                             "No healthy backends available".to_string(),
@@ -278,6 +279,12 @@ impl ProxyServer {
             let backend_url = format!("{}{}", endpoint_trimmed, path_and_query);
             last_backend = endpoint_trimmed.to_string();
 
+            // Track this backend as tried (for retry logic)
+            tried_backends.insert(backend_idx);
+
+            // Track connection for load balancing (LeastConnections, PowerOfTwo)
+            self.core.begin_request(backend_idx);
+
             let start = std::time::Instant::now();
             let result = s3_client
                 .proxy_request(method.clone(), &backend_url, extra_headers.clone(), body.clone())
@@ -289,6 +296,7 @@ impl ProxyServer {
                     if (status == StatusCode::TOO_MANY_REQUESTS || status == StatusCode::SERVICE_UNAVAILABLE)
                         && attempt < MAX_RETRIES - 1
                     {
+                        self.core.end_request(backend_idx);
                         self.core.record_failure(backend_idx);
                         // Exponential backoff: 200ms, 400ms, 800ms, 1600ms, 3200ms, 5000ms (capped)
                         // Add jitter: ±25% to avoid thundering herd
@@ -311,6 +319,7 @@ impl ProxyServer {
                     }
 
                     // Success or non-retryable error
+                    self.core.end_request(backend_idx);
                     if status.is_success() {
                         self.core.record_success(backend_idx);
                     } else if status.is_server_error() {
@@ -331,7 +340,14 @@ impl ProxyServer {
                     break;
                 }
                 Err(e) => {
-                    self.core.record_failure(backend_idx);
+                    self.core.end_request(backend_idx);
+                    // Connection errors mark backend immediately unhealthy
+                    let err_str = e.to_string();
+                    if crate::core::Core::is_connect_error(&err_str) {
+                        self.core.record_connect_failure(backend_idx);
+                    } else {
+                        self.core.record_failure(backend_idx);
+                    }
                     let elapsed = start.elapsed();
 
                     if attempt < MAX_RETRIES - 1 {

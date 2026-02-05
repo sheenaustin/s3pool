@@ -105,15 +105,33 @@ impl S3Client {
     ///
     /// HTTP optimizations matching mc/sidekick:
     /// - HTTP/1.1 only (HTTP/2 disabled, as mc does)
-    /// - 1024 idle connections per host
-    /// - 90s idle connection timeout
+    /// - Configurable idle connections per host (default 1024)
+    /// - Configurable idle connection timeout (default 90s)
     /// - TCP_NODELAY enabled
-    /// - 90s TCP keepalive
+    /// - Configurable TCP keepalive and connect timeout
     pub fn new(
         access_key: String,
         secret_key: String,
         bucket: String,
         region: Option<String>,
+    ) -> Self {
+        Self::with_pool_config(access_key, secret_key, bucket, region, 1024, 90, 30)
+    }
+
+    /// Create a new S3 client with custom pool configuration
+    ///
+    /// # Arguments
+    /// * `pool_max_idle_per_host` - Max idle connections per backend (default: 1024)
+    /// * `pool_idle_timeout_secs` - Idle timeout in seconds (default: 90)
+    /// * `connect_timeout_secs` - TCP connect timeout in seconds (default: 30)
+    pub fn with_pool_config(
+        access_key: String,
+        secret_key: String,
+        bucket: String,
+        region: Option<String>,
+        pool_max_idle_per_host: usize,
+        pool_idle_timeout_secs: u64,
+        connect_timeout_secs: u64,
     ) -> Self {
         let insecure_tls = std::env::var("S3POOL_INSECURE_TLS")
             .map(|v| v == "true" || v == "1")
@@ -123,8 +141,8 @@ impl S3Client {
         let mut http = HttpConnector::new();
         http.set_nodelay(true);
         http.enforce_http(false);
-        http.set_connect_timeout(Some(Duration::from_secs(10)));
-        http.set_keepalive(Some(Duration::from_secs(90)));
+        http.set_connect_timeout(Some(Duration::from_secs(connect_timeout_secs)));
+        http.set_keepalive(Some(Duration::from_secs(pool_idle_timeout_secs)));
 
         // Build TLS connector using native-tls (OpenSSL)
         let tls = if insecure_tls {
@@ -140,10 +158,10 @@ impl S3Client {
 
         let https = HttpsConnector::from((http, tls.into()));
 
-        // Create hyper client with tuned connection pool matching mc
+        // Create hyper client with configurable connection pool
         let client = HyperClient::builder(TokioExecutor::new())
-            .pool_idle_timeout(Duration::from_secs(90))
-            .pool_max_idle_per_host(1024)
+            .pool_idle_timeout(Duration::from_secs(pool_idle_timeout_secs))
+            .pool_max_idle_per_host(pool_max_idle_per_host)
             .retry_canceled_requests(true)
             .set_host(true)
             .build(https);

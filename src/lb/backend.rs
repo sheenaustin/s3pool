@@ -66,6 +66,19 @@ impl Backend {
         self.health_score.store(new_score, Ordering::Relaxed);
     }
 
+    /// Record a connection failure (immediately marks backend as unhealthy)
+    ///
+    /// Connection failures are a strong signal that the backend is down.
+    /// This reduces health score to ≤30, making the backend unhealthy for
+    /// subsequent selections in the same CLI invocation.
+    pub fn record_connect_failure(&self) {
+        self.failure_count.fetch_add(1, Ordering::Relaxed);
+        // Severe reduction to mark as unhealthy (score ≤30)
+        let current = self.health_score.load(Ordering::Relaxed);
+        let new_score = current.saturating_sub(70);
+        self.health_score.store(new_score, Ordering::Relaxed);
+    }
+
     /// Get the current failure count
     pub fn get_failure_count(&self) -> u32 {
         self.failure_count.load(Ordering::Relaxed)

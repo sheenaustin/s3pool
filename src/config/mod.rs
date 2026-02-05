@@ -84,6 +84,53 @@ impl Default for LoadBalancerConfig {
     }
 }
 
+/// Connection pool configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PoolConfig {
+    /// Maximum connections per backend (default: 100)
+    #[serde(default = "default_pool_max_connections")]
+    pub max_connections: usize,
+
+    /// Minimum connections to keep warm (default: 10)
+    #[serde(default = "default_pool_min_connections")]
+    pub min_connections: usize,
+
+    /// Max idle time in seconds before closing (default: 90)
+    #[serde(default = "default_pool_max_idle_time")]
+    pub max_idle_time: u64,
+
+    /// Connection timeout in seconds (default: 30)
+    #[serde(default = "default_pool_connect_timeout")]
+    pub connect_timeout: u64,
+}
+
+fn default_pool_max_connections() -> usize {
+    100
+}
+
+fn default_pool_min_connections() -> usize {
+    10
+}
+
+fn default_pool_max_idle_time() -> u64 {
+    90
+}
+
+fn default_pool_connect_timeout() -> u64 {
+    30
+}
+
+impl Default for PoolConfig {
+    fn default() -> Self {
+        Self {
+            max_connections: default_pool_max_connections(),
+            min_connections: default_pool_min_connections(),
+            max_idle_time: default_pool_max_idle_time(),
+            connect_timeout: default_pool_connect_timeout(),
+        }
+    }
+}
+
 /// Proxy server configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyConfig {
@@ -120,6 +167,10 @@ pub struct Config {
     #[serde(default)]
     pub load_balancer: LoadBalancerConfig,
 
+    /// Connection pool settings
+    #[serde(default)]
+    pub pool: PoolConfig,
+
     /// Proxy server settings
     #[serde(default)]
     pub proxy: ProxyConfig,
@@ -131,6 +182,7 @@ impl Config {
         Self {
             profiles: HashMap::new(),
             load_balancer: LoadBalancerConfig::default(),
+            pool: PoolConfig::default(),
             proxy: ProxyConfig::default(),
         }
     }
@@ -246,6 +298,31 @@ pub fn load_from_env() -> Result<Config> {
     if let Ok(retries) = std::env::var("LB_MAX_RETRIES") {
         if let Ok(val) = retries.parse() {
             config.load_balancer.max_retries = val;
+        }
+    }
+
+    // Connection pool configuration from env
+    if let Ok(val) = std::env::var("POOL_MAX_CONNECTIONS") {
+        if let Ok(v) = val.parse() {
+            config.pool.max_connections = v;
+        }
+    }
+
+    if let Ok(val) = std::env::var("POOL_MIN_CONNECTIONS") {
+        if let Ok(v) = val.parse() {
+            config.pool.min_connections = v;
+        }
+    }
+
+    if let Ok(val) = std::env::var("POOL_MAX_IDLE_TIME") {
+        if let Ok(v) = val.parse() {
+            config.pool.max_idle_time = v;
+        }
+    }
+
+    if let Ok(val) = std::env::var("POOL_CONNECT_TIMEOUT") {
+        if let Ok(v) = val.parse() {
+            config.pool.connect_timeout = v;
         }
     }
 
