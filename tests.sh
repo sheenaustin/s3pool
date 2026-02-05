@@ -15,7 +15,25 @@ cd "$SCRIPT_DIR"
 BINARY="./target/release/s3pool"
 TEST_BUCKET="${TEST_BUCKET:-webcrawl-dataset}"
 TEST_PREFIX="s3pool-test-$(date +%s)"
-PROXY_URL="http://127.0.0.1:18080"
+PROXY_PID=""
+
+# Find an available port for test proxy
+find_available_port() {
+    local port
+    for _ in {1..20}; do
+        port=$((30000 + RANDOM % 10000))
+        if ! ss -tuln 2>/dev/null | grep -q ":${port} " && \
+           ! netstat -tuln 2>/dev/null | grep -q ":${port} "; then
+            echo "$port"
+            return 0
+        fi
+    done
+    # Fallback to a high random port
+    echo "$((40000 + RANDOM % 10000))"
+}
+
+PROXY_PORT="${PROXY_PORT:-$(find_available_port)}"
+PROXY_URL="http://127.0.0.1:${PROXY_PORT}"
 
 # Colors
 RED='\033[0;31m'
@@ -76,9 +94,64 @@ cleanup() {
     log_info "Cleaning up test artifacts..."
     # Remove test objects if any were created
     $BINARY --insecure --log-level error rm --recursive "s3://${TEST_BUCKET}/${TEST_PREFIX}/" 2>/dev/null || true
+    # Stop proxy if we started it
+    stop_proxy
 }
 
 trap cleanup EXIT
+
+# =============================================================================
+# Proxy Management
+# =============================================================================
+
+start_proxy() {
+    # Check if proxy already running on our port
+    if is_proxy_running; then
+        log_info "Proxy already running at ${PROXY_URL}"
+        return 0
+    fi
+
+    log_info "Starting proxy on port ${PROXY_PORT}..."
+    $BINARY --insecure --log-level error proxy --listen "0.0.0.0:${PROXY_PORT}" &
+    PROXY_PID=$!
+
+    # Wait for proxy to be ready (max 15 seconds)
+    # Check that process is running AND port is listening
+    local attempts=0
+    while [ $attempts -lt 30 ]; do
+        # First check process is still alive
+        if ! kill -0 "$PROXY_PID" 2>/dev/null; then
+            log_fail "Proxy process died unexpectedly"
+            return 1
+        fi
+        # Then check if port is listening
+        if is_proxy_running; then
+            # Give it a moment to fully initialize
+            sleep 0.5
+            log_info "Proxy started (PID: ${PROXY_PID}, port: ${PROXY_PORT})"
+            return 0
+        fi
+        sleep 0.5
+        ((attempts++)) || true
+    done
+
+    log_fail "Failed to start proxy (timeout waiting for port ${PROXY_PORT})"
+    return 1
+}
+
+stop_proxy() {
+    if [ -n "$PROXY_PID" ] && kill -0 "$PROXY_PID" 2>/dev/null; then
+        log_info "Stopping proxy (PID: ${PROXY_PID})..."
+        kill "$PROXY_PID" 2>/dev/null || true
+        wait "$PROXY_PID" 2>/dev/null || true
+        PROXY_PID=""
+    fi
+}
+
+is_proxy_running() {
+    ss -tuln 2>/dev/null | grep -q ":${PROXY_PORT} " || \
+    netstat -tuln 2>/dev/null | grep -q ":${PROXY_PORT} "
+}
 
 # =============================================================================
 # Build Tests
@@ -291,22 +364,9 @@ test_load_balancer() {
 test_proxy() {
     log_section "Proxy Tests"
 
-    # Check if proxy is configured
-    local proxy_listen
-    proxy_listen=$(grep "^PROXY_LISTEN=" .env | cut -d= -f2 | cut -d'#' -f1 | tr -d ' ')
-
-    if [ -z "$proxy_listen" ]; then
-        log_skip "Proxy tests (PROXY_LISTEN not configured)"
-        return
-    fi
-
-    PROXY_URL="http://${proxy_listen}"
-
-    # Check if proxy is running
-    if ! curl -s --connect-timeout 2 "${PROXY_URL}/" >/dev/null 2>&1; then
-        log_skip "Proxy tests (proxy not running at ${PROXY_URL})"
-        log_info "Start proxy with: $BINARY --insecure proxy"
-        return
+    # Auto-start proxy if not running
+    if ! is_proxy_running; then
+        start_proxy || return
     fi
 
     log_info "Proxy running at ${PROXY_URL}"
@@ -347,6 +407,101 @@ test_proxy() {
         log_skip "Proxy GET (PUT failed)"
         log_skip "Proxy DELETE (PUT failed)"
     fi
+}
+
+# =============================================================================
+# CLI vs Proxy Consistency Tests
+# =============================================================================
+
+test_consistency() {
+    log_section "CLI vs Proxy Consistency Tests"
+
+    # Ensure proxy is running
+    if ! is_proxy_running; then
+        start_proxy || return
+    fi
+
+    local test_key="${TEST_PREFIX}/consistency-test.txt"
+    local test_content="Consistency test content $(date +%s)"
+    local test_file="/tmp/s3pool-consistency-$$.txt"
+    local download_cli="/tmp/s3pool-download-cli-$$.txt"
+    local download_proxy="/tmp/s3pool-download-proxy-$$.txt"
+
+    echo "$test_content" > "$test_file"
+
+    # Test 1: Upload via CLI, download via both CLI and proxy
+    log_info "Testing: CLI upload -> CLI download vs proxy download"
+
+    if $BINARY --insecure --log-level error cp "$test_file" "s3://${TEST_BUCKET}/${test_key}" 2>/dev/null; then
+        # Download via CLI
+        $BINARY --insecure --log-level error cp "s3://${TEST_BUCKET}/${test_key}" "$download_cli" 2>/dev/null || true
+
+        # Download via proxy
+        curl -s "${PROXY_URL}/${TEST_BUCKET}/${test_key}" > "$download_proxy" 2>/dev/null || true
+
+        ((TESTS_RUN++)) || true
+        if diff -q "$test_file" "$download_cli" >/dev/null 2>&1 && diff -q "$test_file" "$download_proxy" >/dev/null 2>&1; then
+            log_pass "CLI upload: CLI and proxy downloads match"
+        else
+            log_fail "CLI upload: CLI and proxy downloads don't match"
+        fi
+
+        # Cleanup this test object
+        $BINARY --insecure --log-level error rm "s3://${TEST_BUCKET}/${test_key}" 2>/dev/null || true
+    else
+        log_fail "CLI upload failed for consistency test"
+        ((TESTS_RUN++)) || true
+    fi
+
+    # Test 2: Upload via proxy, download via both CLI and proxy
+    log_info "Testing: Proxy upload -> CLI download vs proxy download"
+
+    local test_key2="${TEST_PREFIX}/consistency-test2.txt"
+    if echo "$test_content" | curl -s -X PUT "${PROXY_URL}/${TEST_BUCKET}/${test_key2}" -d @- >/dev/null 2>&1; then
+        # Download via CLI
+        $BINARY --insecure --log-level error cp "s3://${TEST_BUCKET}/${test_key2}" "$download_cli" 2>/dev/null || true
+
+        # Download via proxy
+        curl -s "${PROXY_URL}/${TEST_BUCKET}/${test_key2}" > "$download_proxy" 2>/dev/null || true
+
+        ((TESTS_RUN++)) || true
+        if [ "$(cat "$download_cli")" = "$test_content" ] && [ "$(cat "$download_proxy")" = "$test_content" ]; then
+            log_pass "Proxy upload: CLI and proxy downloads match"
+        else
+            log_fail "Proxy upload: CLI and proxy downloads don't match"
+        fi
+
+        # Cleanup this test object
+        curl -s -X DELETE "${PROXY_URL}/${TEST_BUCKET}/${test_key2}" >/dev/null 2>&1 || true
+    else
+        log_fail "Proxy upload failed for consistency test"
+        ((TESTS_RUN++)) || true
+    fi
+
+    # Test 3: List via CLI vs proxy (compare object counts)
+    log_info "Testing: CLI ls vs proxy LIST (object count comparison)"
+
+    local cli_count proxy_count
+    cli_count=$($BINARY --insecure --log-level error ls "s3://${TEST_BUCKET}/loadtest/0/" 2>/dev/null | head -100 | wc -l)
+
+    # Parse proxy XML response for object count
+    proxy_count=$(curl -s "${PROXY_URL}/${TEST_BUCKET}/?prefix=loadtest/0/&max-keys=100" 2>/dev/null | grep -c "<Key>" || echo "0")
+
+    ((TESTS_RUN++)) || true
+    if [ "$cli_count" -gt 0 ] && [ "$proxy_count" -gt 0 ]; then
+        # Allow some variance due to timing, but counts should be close
+        local diff_count=$((cli_count > proxy_count ? cli_count - proxy_count : proxy_count - cli_count))
+        if [ "$diff_count" -le 5 ]; then
+            log_pass "CLI vs proxy list counts match (CLI: $cli_count, Proxy: $proxy_count)"
+        else
+            log_fail "CLI vs proxy list counts differ significantly (CLI: $cli_count, Proxy: $proxy_count)"
+        fi
+    else
+        log_fail "CLI or proxy list returned no results (CLI: $cli_count, Proxy: $proxy_count)"
+    fi
+
+    # Cleanup temp files
+    rm -f "$test_file" "$download_cli" "$download_proxy"
 }
 
 # =============================================================================
@@ -434,6 +589,7 @@ main() {
     echo "=================================="
     echo "Bucket: ${TEST_BUCKET}"
     echo "Test prefix: ${TEST_PREFIX}"
+    echo "Proxy port: ${PROXY_PORT}"
     echo ""
 
     # Run all test suites
@@ -444,6 +600,7 @@ main() {
     test_retry_logic
     test_load_balancer
     test_proxy
+    test_consistency
     test_code_quality
     # Skip performance test for faster CI (uncomment for full benchmarking)
     # test_performance
